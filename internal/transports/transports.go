@@ -134,7 +134,7 @@ type Stream struct { // <-!!!
 // subsequent reads will read the rest of the message
 func (s *Stream) Read(p []byte) (n int, err error) {
 	if s.n == 0 {
-		header, err := decodeMessageHeader(s.Conn)
+		header, err := readHeader(s.Conn)
 		if err != nil {
 			return 0, err
 		}
@@ -160,7 +160,7 @@ func (s *Stream) ReadFull() ([]byte, error) {
 		return []byte{}, ErrPartialRead
 	}
 
-	h, err := decodeMessageHeader(s.Conn)
+	h, err := readHeader(s.Conn)
 	if err != nil {
 		return []byte{}, err
 	}
@@ -175,12 +175,12 @@ func (s *Stream) ReadFull() ([]byte, error) {
 
 // Writes message to Stream
 func (s *Stream) Write(p []byte) (n int, err error) {
-	header := messageHeader{
+	header := header{
 		Version: 0,
 		Type:    0,
 		Length:  uint32(len(p)),
 	}
-	err = encodeMessageHeader(s.Conn, header)
+	err = writeHeader(s.Conn, header)
 	if err != nil {
 		return
 	}

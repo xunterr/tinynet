@@ -1,8 +1,6 @@
 package transports
 
 import (
-	"errors"
-	"io"
 	"net"
 	"sync"
 )
@@ -10,24 +8,6 @@ import (
 type Mux interface {
 	Open() (net.Conn, error)
 	Accept() (net.Conn, error)
-}
-
-type Router interface {
-	Route(Message)
-}
-
-type Message struct {
-	From    string
-	To      string
-	Payload *Payload
-}
-
-type Payload struct {
-	NodeId        string
-	MessageId     string
-	CorrelationId string
-	Version       int
-	Body          []byte
 }
 
 type MuxFunc func(net.Conn) (Mux, error)
@@ -38,17 +18,24 @@ type asymMux struct {
 }
 
 // set up a muxer
-func WithMux(client MuxFunc, server MuxFunc) {}
+func WithMux(client MuxFunc, server MuxFunc) Option {
+	return func(t *Transports) {
+		t.mux = asymMux{
+			client: client,
+			server: server,
+		}
+	}
+}
 
 // sets up a symmetrical muxer (client and server muxers are the same)
 func SymMux(m MuxFunc) (MuxFunc, MuxFunc) {
 	return m, m
 }
 
-type Transports struct {
-	router Router
+type Option func(*Transports)
 
-	nodeId string
+type Transports struct {
+	handle func(*Stream)
 
 	connMu      sync.RWMutex
 	connections map[string]Mux
@@ -56,11 +43,30 @@ type Transports struct {
 	mux asymMux
 }
 
-func NewTransports() *Transports {
-	return &Transports{}
+func NewTransports(opts ...Option) *Transports {
+	t := &Transports{
+		connections: make(map[string]Mux),
+	}
+
+	for _, opt := range opts {
+		opt(t)
+	}
+
+	return t
 }
 
-func (t *Transports) dial(addr string) (io.ReadWriteCloser, error) {
+func (t *Transports) SetMux(client MuxFunc, server MuxFunc) {
+	t.mux = asymMux{
+		client: client,
+		server: server,
+	}
+}
+
+func (t *Transports) SetHandleFunc(h func(*Stream)) {
+	t.handle = h
+}
+
+func (t *Transports) dial(addr string) (net.Conn, error) {
 	t.connMu.RLock()
 	mux, ok := t.connections[addr]
 	t.connMu.RUnlock()
@@ -82,7 +88,13 @@ func (t *Transports) dial(addr string) (io.ReadWriteCloser, error) {
 	return mux.Open()
 }
 
-func (t *Transports) Send(addr string, data []byte) error { return nil }
+func (t *Transports) Dial(addr string) (*Stream, error) {
+	c, err := t.dial(addr)
+	if err != nil {
+		return nil, err
+	}
+	return newStream(c), nil
+}
 
 func (t *Transports) Listen(addr string) error {
 	l, err := net.Listen("tcp", addr)
@@ -111,79 +123,15 @@ func (t *Transports) Listen(addr string) error {
 
 func (t *Transports) handleSession(mux Mux) error {
 	for {
-		_, err := mux.Accept()
+		c, err := mux.Accept()
 		if err != nil {
 			if _, ok := err.(net.Error); ok {
 				return err
 			}
 			continue
 		}
-		// go t.handle(c)
+
+		s := newStream(c)
+		go t.handle(s)
 	}
-}
-
-var ErrPartialRead error = errors.New("Partially read message")
-
-type Stream struct { // <-!!!
-	net.Conn
-	n int
-}
-
-// Reads at most one message from Stream.
-// If p isn't large enough, reads len(p) bytes, and
-// subsequent reads will read the rest of the message
-func (s *Stream) Read(p []byte) (n int, err error) {
-	if s.n == 0 {
-		header, err := readHeader(s.Conn)
-		if err != nil {
-			return 0, err
-		}
-		s.n = int(header.Length)
-	}
-
-	right := min(len(p), s.n)
-	readN, err := io.ReadFull(s.Conn, p[:right])
-	s.n -= readN
-	if err != nil {
-		s.n = 0
-		if err != io.ErrUnexpectedEOF {
-			return 0, err
-		}
-	}
-	return readN, nil
-}
-
-// Reads at most one message from Stream.
-// ErrPartialRead if there is a partially read message
-func (s *Stream) ReadFull() ([]byte, error) {
-	if s.n != 0 {
-		return []byte{}, ErrPartialRead
-	}
-
-	h, err := readHeader(s.Conn)
-	if err != nil {
-		return []byte{}, err
-	}
-
-	bytes := make([]byte, h.Length)
-	_, err = io.ReadFull(s.Conn, bytes)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return []byte{}, err
-	}
-	return bytes, nil
-}
-
-// Writes message to Stream
-func (s *Stream) Write(p []byte) (n int, err error) {
-	header := header{
-		Version: 0,
-		Type:    0,
-		Length:  uint32(len(p)),
-	}
-	err = writeHeader(s.Conn, header)
-	if err != nil {
-		return
-	}
-
-	return s.Conn.Write(p)
 }

@@ -13,7 +13,7 @@ type header struct {
 	Tlvs    []tlv
 }
 
-const MIN_TLV_SIZE = 2
+const MinTlvSize = 2
 
 type tlv struct {
 	Type  uint8
@@ -57,11 +57,11 @@ func parseHeader(bytes []byte) (int, header) {
 }
 
 func parseTlvs(bytes []byte) (int, []tlv) {
-	est := len(bytes) / (MIN_TLV_SIZE + 8)
+	est := len(bytes) / (MinTlvSize + 8)
 	tlvs := make([]tlv, 0, est)
 
 	var totalN int
-	for len(bytes) >= MIN_TLV_SIZE {
+	for len(bytes) >= MinTlvSize {
 		n, tlv, err := parseTlv(bytes[:])
 		if err == nil {
 			tlvs = append(tlvs, tlv)
@@ -76,14 +76,14 @@ func parseTlvs(bytes []byte) (int, []tlv) {
 var ErrMalformedTLV error = errors.New("Malformed TLV")
 
 func parseTlv(bytes []byte) (int, tlv, error) {
-	if len(bytes) < MIN_TLV_SIZE {
+	if len(bytes) < MinTlvSize {
 		return len(bytes), tlv{}, ErrMalformedTLV
 	}
 
 	typ := bytes[0]
 	length := bytes[1]
 
-	tlvLen := int(length) + MIN_TLV_SIZE
+	tlvLen := int(length) + MinTlvSize
 
 	if len(bytes) < tlvLen {
 		return len(bytes), tlv{}, ErrMalformedTLV
@@ -98,7 +98,7 @@ func parseTlv(bytes []byte) (int, tlv, error) {
 }
 
 func marshalHeader(h header) []byte {
-	tlvMaxSize := len(h.Tlvs) * (MIN_TLV_SIZE + 255)
+	tlvMaxSize := len(h.Tlvs) * (MinTlvSize + 255)
 	bytes := make([]byte, 13+tlvMaxSize)
 	bytes[4] = h.Version
 	binary.BigEndian.PutUint32(bytes[5:9], h.Type)
@@ -121,14 +121,14 @@ func marshalTlv(t tlv, bytes []byte) int {
 		length = 255
 	}
 
-	if len(bytes) < MIN_TLV_SIZE+length {
-		length = len(bytes) - MIN_TLV_SIZE
+	if len(bytes) < MinTlvSize+length {
+		length = len(bytes) - MinTlvSize
 	}
 
 	bytes[0] = t.Type
 	bytes[1] = uint8(length)
 	copy(bytes[2:], t.Value[:length])
-	return MIN_TLV_SIZE + length
+	return MinTlvSize + length
 }
 
 func writeHeader(w io.Writer, h header) error {

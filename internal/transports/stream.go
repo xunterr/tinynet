@@ -21,8 +21,26 @@ func newStream(c net.Conn) *Stream {
 }
 
 type Message struct {
-	Headers map[uint8][]byte
+	headers []tlv
 	Body    []byte
+}
+
+func (m *Message) SetHeader(id byte, val []byte) {
+	m.headers = append(m.headers, tlv{
+		Type:  id,
+		Value: val,
+	})
+}
+
+// Get header by its id
+// O(n) lookup
+func (m *Message) GetHeader(id byte) ([]byte, bool) {
+	for _, h := range m.headers {
+		if h.Type == id {
+			return h.Value, true
+		}
+	}
+	return []byte{}, false
 }
 
 // Reads at most one message from Stream.
@@ -64,12 +82,8 @@ func (s *Stream) ReadMessage() (Message, error) {
 		return Message{}, err
 	}
 
-	headers := make(map[uint8][]byte, len(h.Tlvs))
-	for _, t := range h.Tlvs {
-		headers[t.Type] = t.Value
-	}
 	return Message{
-		Headers: headers,
+		headers: h.Tlvs,
 		Body:    bytes,
 	}, nil
 }
@@ -92,17 +106,34 @@ func (s *Stream) read() (header, []byte, error) {
 	return h, bytes, nil
 }
 
-// Writes message to Stream
+// Write message bytes to Stream
 func (s *Stream) Write(p []byte) (n int, err error) {
 	header := header{
 		Version: 0,
 		Type:    0,
 		Length:  uint32(len(p)),
 	}
-	err = writeHeader(s.Conn, header)
+	return s.write(header, p)
+}
+
+// Write Message to Stream
+func (s *Stream) WriteMessage(msg Message) (n int, err error) {
+	header := header{
+		Version: 0,
+		Type:    0,
+		Length:  uint32(len(msg.Body)),
+		Tlvs:    msg.headers,
+	}
+
+	return s.write(header, msg.Body)
+}
+
+func (s *Stream) write(h header, b []byte) (n int, err error) {
+	h.Length = uint32(len(b))
+	err = writeHeader(s.Conn, h)
 	if err != nil {
 		return
 	}
 
-	return s.Conn.Write(p)
+	return s.Conn.Write(b)
 }

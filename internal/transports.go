@@ -1,14 +1,27 @@
-package transports
+package internal
 
 import (
 	"net"
 	"sync"
 )
 
+// Used on Stream initialization for sharing stream-scope headers.
+type Handshake interface {
+	Accept(*Stream) ([]Header, error)
+	Propose(*Stream, []Header) error
+}
+
 type Mux interface {
 	Open() (net.Conn, error)
 	Accept() (net.Conn, error)
 }
+
+type NopMux struct {
+	conn net.Conn
+}
+
+func (m *NopMux) Open() (net.Conn, error)   { return m.conn, nil }
+func (m *NopMux) Accept() (net.Conn, error) { return m.conn, nil }
 
 type MuxFunc func(net.Conn) (Mux, error)
 
@@ -16,6 +29,8 @@ type asymMux struct {
 	client MuxFunc
 	server MuxFunc
 }
+
+type Option func(*Transports)
 
 // set up a muxer
 func WithMux(client MuxFunc, server MuxFunc) Option {
@@ -32,20 +47,27 @@ func SymMux(m MuxFunc) (MuxFunc, MuxFunc) {
 	return m, m
 }
 
-type Option func(*Transports)
+func WithHandshake(h Handshake) Option {
+	return func(t *Transports) { t.handshake = h }
+}
 
 type Transports struct {
-	handle func(*Stream)
+	handle func(*Stream, Headers)
+
+	handshake Handshake
 
 	connMu      sync.RWMutex
 	connections map[string]Mux
 
 	mux asymMux
+
+	once sync.Once
 }
 
 func NewTransports(opts ...Option) *Transports {
 	t := &Transports{
 		connections: make(map[string]Mux),
+		handshake:   &DefaultHandshake{},
 	}
 
 	for _, opt := range opts {
@@ -62,7 +84,7 @@ func (t *Transports) SetMux(client MuxFunc, server MuxFunc) {
 	}
 }
 
-func (t *Transports) SetHandleFunc(h func(*Stream)) {
+func (t *Transports) SetHandleFunc(h func(*Stream, Headers)) {
 	t.handle = h
 }
 
@@ -84,19 +106,34 @@ func (t *Transports) dial(addr string) (net.Conn, error) {
 		t.connMu.Lock()
 		t.connections[addr] = mux
 		t.connMu.Unlock()
+
+		go t.handleSession(mux)
 	}
 	return mux.Open()
 }
 
-func (t *Transports) Dial(addr string) (*Stream, error) {
+func (t *Transports) Dial(addr string, headers ...Header) (*Stream, error) {
 	c, err := t.dial(addr)
 	if err != nil {
 		return nil, err
 	}
-	return newStream(c), nil
+	s := newStream(c)
+	err = t.handshake.Propose(s, headers)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 func (t *Transports) Listen(addr string) error {
+	var err error
+	t.once.Do(func() {
+		err = t.listen(addr)
+	})
+	return err
+}
+
+func (t *Transports) listen(addr string) error {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil
@@ -132,6 +169,11 @@ func (t *Transports) handleSession(mux Mux) error {
 		}
 
 		s := newStream(c)
-		go t.handle(s)
+		headers, err := t.handshake.Accept(s)
+		if err != nil {
+			s.Close()
+			return err
+		}
+		go t.handle(s, headers)
 	}
 }

@@ -1,10 +1,15 @@
-package transports
+package internal
 
 import (
 	"errors"
 	"io"
 	"net"
+
+	"github.com/xunterr/tinynet/internal/protocol"
 )
+
+type Header = protocol.Tlv
+type Headers []protocol.Tlv
 
 var ErrPartialRead error = errors.New("Partially read message")
 
@@ -21,22 +26,39 @@ func newStream(c net.Conn) *Stream {
 }
 
 type Message struct {
-	headers []tlv
+	Headers Headers
 	Body    []byte
 }
 
-func (m *Message) SetHeader(id byte, val []byte) {
-	m.headers = append(m.headers, tlv{
-		Type:  id,
-		Value: val,
-	})
+func FromBytes(b []byte) Message {
+	return Message{
+		Body:    b,
+		Headers: make(Headers, 0),
+	}
 }
 
-// Get header by its id
+// As user-space header
+func AsHeader(id byte, val []byte) Header {
+	return Header{
+		Type:  protocol.WithNamespace(protocol.CustomNamespace, id),
+		Value: val,
+	}
+}
+
+func (h *Headers) AddHeader(id byte, val []byte) {
+	*h = append(*h, AsHeader(id, val))
+}
+
+// Get user-space header by its id
 // O(n) lookup
-func (m *Message) GetHeader(id byte) ([]byte, bool) {
-	for _, h := range m.headers {
-		if h.Type == id {
+func (h Headers) GetHeader(id byte) ([]byte, bool) {
+	return h.getHeader(protocol.WithNamespace(protocol.CustomNamespace, id))
+}
+
+// Get header by its key
+func (h Headers) getHeader(key uint16) ([]byte, bool) {
+	for _, h := range h {
+		if h.Type == key {
 			return h.Value, true
 		}
 	}
@@ -48,7 +70,7 @@ func (m *Message) GetHeader(id byte) ([]byte, bool) {
 // subsequent reads will read the rest of the message
 func (s *Stream) Read(p []byte) (n int, err error) {
 	if s.n == 0 {
-		header, err := readHeader(s.Conn)
+		header, err := protocol.ReadHeader(s.Conn)
 		if err != nil {
 			return 0, err
 		}
@@ -83,32 +105,32 @@ func (s *Stream) ReadMessage() (Message, error) {
 	}
 
 	return Message{
-		headers: h.Tlvs,
+		Headers: h.Tlvs,
 		Body:    bytes,
 	}, nil
 }
 
-func (s *Stream) read() (header, []byte, error) {
+func (s *Stream) read() (protocol.Header, []byte, error) {
 	if s.n != 0 {
-		return header{}, []byte{}, ErrPartialRead
+		return protocol.Header{}, []byte{}, ErrPartialRead
 	}
 
-	h, err := readHeader(s.Conn)
+	h, err := protocol.ReadHeader(s.Conn)
 	if err != nil {
-		return header{}, []byte{}, err
+		return protocol.Header{}, []byte{}, err
 	}
 
 	bytes := make([]byte, h.Length)
 	_, err = io.ReadFull(s.Conn, bytes)
 	if err != nil && err != io.ErrUnexpectedEOF {
-		return header{}, []byte{}, err
+		return protocol.Header{}, []byte{}, err
 	}
 	return h, bytes, nil
 }
 
 // Write message bytes to Stream
 func (s *Stream) Write(p []byte) (n int, err error) {
-	header := header{
+	header := protocol.Header{
 		Version: 0,
 		Type:    0,
 		Length:  uint32(len(p)),
@@ -118,19 +140,19 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 
 // Write Message to Stream
 func (s *Stream) WriteMessage(msg Message) (n int, err error) {
-	header := header{
+	header := protocol.Header{
 		Version: 0,
 		Type:    0,
 		Length:  uint32(len(msg.Body)),
-		Tlvs:    msg.headers,
+		Tlvs:    msg.Headers,
 	}
 
 	return s.write(header, msg.Body)
 }
 
-func (s *Stream) write(h header, b []byte) (n int, err error) {
+func (s *Stream) write(h protocol.Header, b []byte) (n int, err error) {
 	h.Length = uint32(len(b))
-	err = writeHeader(s.Conn, h)
+	err = protocol.WriteHeader(s.Conn, h)
 	if err != nil {
 		return
 	}

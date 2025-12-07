@@ -1,16 +1,16 @@
-package transports
+package protocol
 
 import (
 	"bytes"
 	"testing"
 )
 
-func BenchmarkEncodeDecode(b *testing.B) {
-	messageHeader := header{
+func TestTlv(t *testing.T) {
+	messageHeader := Header{
 		Version: 1,
 		Type:    12,
 		Length:  54,
-		Tlvs: []tlv{
+		Tlvs: []Tlv{
 			{Type: 1, Value: []byte{1, 2, 3, 4, 5, 6, 7}},
 			{Type: 2, Value: []byte{1, 2, 4, 4, 5, 6, 7}},
 			{Type: 3, Value: []byte{1, 2, 1, 4, 5, 6, 7}},
@@ -23,41 +23,45 @@ func BenchmarkEncodeDecode(b *testing.B) {
 	}
 
 	buf := bytes.NewBuffer([]byte{})
-	err := writeHeader(buf, messageHeader)
-	r := bytes.NewReader(nil)
+	err := WriteHeader(buf, messageHeader)
 
 	if err != nil {
-		b.Fatalf("Failed to encode a message header: %s", err)
+		t.Fatalf("Failed to encode a message Header: %s", err)
 	}
 
-	data := buf.Bytes()
-	b.ReportAllocs()
+	decoded, err := ReadHeader(buf)
+	if err != nil {
+		t.Fatalf("Failed to decode a message Header: %s", err)
+	}
 
-	for i := 0; i < b.N; i++ {
-		r.Reset(data)
-		if _, err := readHeader(r); err != nil {
-			b.Fatal(err)
+	if len(decoded.Tlvs) != len(messageHeader.Tlvs) {
+		t.Fatalf("Wrong TLVs length.")
+	}
+	for i, tlv := range decoded.Tlvs {
+		realTlv := messageHeader.Tlvs[i]
+		if !bytes.Equal(realTlv.Value, tlv.Value) || realTlv.Type != tlv.Type {
+			t.Errorf("Have: %v, want: %v", realTlv, tlv)
 		}
 	}
 }
 
 func TestEncodeDecode(t *testing.T) {
-	messageHeader := header{
+	messageHeader := Header{
 		Version: 1,
 		Type:    12,
 		Length:  54,
 	}
 
 	buf := bytes.NewBuffer([]byte{})
-	err := writeHeader(buf, messageHeader)
+	err := WriteHeader(buf, messageHeader)
 
 	if err != nil {
-		t.Fatalf("Failed to encode a message header: %s", err)
+		t.Fatalf("Failed to encode a message Header: %s", err)
 	}
 
-	decoded, err := readHeader(buf)
+	decoded, err := ReadHeader(buf)
 	if err != nil {
-		t.Fatalf("Failed to decode a message header: %s", err)
+		t.Fatalf("Failed to decode a message Header: %s", err)
 	}
 
 	if decoded.Version != messageHeader.Version ||

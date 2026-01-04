@@ -15,7 +15,8 @@ var ErrPartialRead error = errors.New("Partially read message")
 
 type Stream struct { // <-!!!
 	net.Conn
-	n int
+	n       int
+	onClose func()
 }
 
 func newStream(c net.Conn) *Stream {
@@ -63,6 +64,16 @@ func (h Headers) getHeader(key uint16) ([]byte, bool) {
 		}
 	}
 	return []byte{}, false
+}
+
+func (s *Stream) setOnClose(f func()) {
+	s.onClose = f
+}
+
+func (s *Stream) Close() (err error) {
+	err = s.Conn.Close()
+	s.onClose()
+	return
 }
 
 // Reads at most one message from Stream.

@@ -15,6 +15,7 @@ var ErrPartialRead error = errors.New("Partially read message")
 
 type Stream struct { // <-!!!
 	net.Conn
+	conn    *Conn
 	n       int
 	onClose func()
 }
@@ -83,6 +84,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	if s.n == 0 {
 		header, err := protocol.ReadHeader(s.Conn)
 		if err != nil {
+			s.conn.TryClose()
 			return 0, err
 		}
 		s.n = int(header.Length)
@@ -94,6 +96,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	if err != nil {
 		s.n = 0
 		if err != io.ErrUnexpectedEOF {
+			s.conn.TryClose()
 			return 0, err
 		}
 	}
@@ -128,12 +131,14 @@ func (s *Stream) read() (protocol.Header, []byte, error) {
 
 	h, err := protocol.ReadHeader(s.Conn)
 	if err != nil {
+		s.conn.TryClose()
 		return protocol.Header{}, []byte{}, err
 	}
 
 	bytes := make([]byte, h.Length)
 	_, err = io.ReadFull(s.Conn, bytes)
 	if err != nil && err != io.ErrUnexpectedEOF {
+		s.conn.TryClose()
 		return protocol.Header{}, []byte{}, err
 	}
 	return h, bytes, nil

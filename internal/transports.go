@@ -30,7 +30,7 @@ type Handshake interface {
 type Mux interface {
 	Open() (net.Conn, error)
 	Accept() (net.Conn, error)
-	NumStreams() int
+	IsClosed() bool
 	Close() error
 }
 
@@ -41,12 +41,12 @@ type asymMux struct {
 	server MuxFunc
 }
 
-type Option func(*Transports)
+type Option func(*Node)
 
 // set up a muxer
 func WithMux(client MuxFunc, server MuxFunc) Option {
-	return func(t *Transports) {
-		t.mux = asymMux{
+	return func(n *Node) {
+		n.mux = asymMux{
 			client: client,
 			server: server,
 		}
@@ -59,43 +59,20 @@ func SymMux(m MuxFunc) (MuxFunc, MuxFunc) {
 }
 
 func WithHandshake(h Handshake) Option {
-	return func(t *Transports) { t.handshake = h }
-}
-
-type conn struct {
-	connId []byte
-
-	conn net.Conn
-	mux  Mux
-
-	ready chan struct{}
-
-	onClose func()
-}
-
-func (c *conn) isActive() bool {
-	if c.mux != nil {
-		return c.mux.NumStreams() != 0
-	}
-	return false
-}
-
-func (c *conn) Close() error {
-	if c.onClose != nil {
-		c.onClose()
-	}
-	c.mux.Close()
-	return c.conn.Close()
+	return func(n *Node) { n.handshake = h }
 }
 
 type dialAttempt struct {
 	active bool
 	ch     chan struct{}
-	c      *conn
+	c      *Conn
 	err    error
 }
 
-func (d *dialAttempt) notify(c *conn, err error) {
+func (d *dialAttempt) notify(c *Conn, err error) {
+	if !d.active {
+		return
+	}
 	d.c = c
 	d.err = err
 	close(d.ch)
@@ -104,22 +81,22 @@ func (d *dialAttempt) notify(c *conn, err error) {
 
 type connPool struct {
 	sync.Mutex
-	p     []*conn
+	p     []*Conn
 	limit int
-	da    dialAttempt
+	da    *dialAttempt
 }
 
 func (p *connPool) sweep() {
 	for _, c := range p.p {
-		if !c.isActive() {
+		if !c.IsActive() {
 			c.Close()
 		}
 	}
 }
 
-func (p *connPool) pick() (*conn, bool) {
+func (p *connPool) pick() (*Conn, bool) {
 	for _, c := range p.p {
-		if c.isActive() {
+		if c.IsActive() {
 			return c, true
 		} else {
 			p.delete(c)
@@ -128,11 +105,20 @@ func (p *connPool) pick() (*conn, bool) {
 	return nil, false
 }
 
+func (p *connPool) initDialAttempt() {
+	p.da = &dialAttempt{
+		ch:     make(chan struct{}),
+		active: true,
+		c:      nil,
+		err:    nil,
+	}
+}
+
 func (p *connPool) canAppend() bool {
 	return len(p.p) < p.limit
 }
 
-func (p *connPool) append(c *conn) bool {
+func (p *connPool) append(c *Conn) bool {
 	if !p.canAppend() {
 		return false
 	}
@@ -140,7 +126,7 @@ func (p *connPool) append(c *conn) bool {
 	return true
 }
 
-func (p *connPool) delete(c *conn) bool {
+func (p *connPool) delete(c *Conn) bool {
 	for i, v := range p.p {
 		if bytes.Compare(c.connId, v.connId) == 0 {
 			last := len(p.p) - 1
@@ -152,8 +138,8 @@ func (p *connPool) delete(c *conn) bool {
 	return false
 }
 
-type Transports struct {
-	handle func(*Stream, Headers)
+type Node struct {
+	handleConn func(*Conn)
 
 	handshake Handshake
 
@@ -168,18 +154,18 @@ type Transports struct {
 	once sync.Once
 }
 
-func NewTransports(opts ...Option) *Transports {
-	t := &Transports{
+func NewNode(opts ...Option) *Node {
+	n := &Node{
 		connections:    make(map[string]*connPool),
 		handshake:      &DefaultHandshake{},
 		maxConnPerNode: 1,
 	}
 
 	for _, opt := range opts {
-		opt(t)
+		opt(n)
 	}
 
-	return t
+	return n
 }
 
 func makeNodeId(key string) []byte {
@@ -187,33 +173,53 @@ func makeNodeId(key string) []byte {
 	return sum[:16]
 }
 
-func (t *Transports) SetMux(client MuxFunc, server MuxFunc) {
-	t.mux = asymMux{
+func (n *Node) SetMux(client MuxFunc, server MuxFunc) {
+	n.mux = asymMux{
 		client: client,
 		server: server,
 	}
 }
 
-func (t *Transports) SetHandleFunc(h func(*Stream, Headers)) {
-	t.handle = h
+func (n *Node) SetHandleFunc(h func(*Conn)) {
+	n.handleConn = h
 }
 
-func (t *Transports) getOrMakePool(key string) *connPool {
-	t.connMu.Lock()
-	p, ok := t.connections[key]
+func (n *Node) getOrMakePool(key string) *connPool {
+	n.connMu.Lock()
+	p, ok := n.connections[key]
 	if !ok {
 		p = &connPool{
-			p:     make([]*conn, 0, t.maxConnPerNode),
-			limit: t.maxConnPerNode,
+			p:     make([]*Conn, 0, n.maxConnPerNode),
+			limit: n.maxConnPerNode,
+			da:    &dialAttempt{},
 		}
-		t.connections[key] = p
+		n.connections[key] = p
 	}
-	t.connMu.Unlock()
+	n.connMu.Unlock()
 	return p
 }
 
-func (t *Transports) dial(addr string) (*conn, error) {
-	p := t.getOrMakePool(string(makeNodeId(addr)))
+func (n *Node) Dial(addr string) (*Conn, error) {
+	p := n.getOrMakePool(string(makeNodeId(addr)))
+	p.Lock()
+	if p.da.active {
+		da := p.da
+		p.Unlock()
+		<-da.ch
+		p.Lock()
+	}
+
+	if !p.canAppend() {
+		p.Unlock()
+		return nil, ErrConnLimit
+	}
+	p.initDialAttempt()
+	p.Unlock()
+	return n.dialOnPool(p, addr)
+}
+
+func (n *Node) PickOrDial(addr string) (*Conn, error) {
+	p := n.getOrMakePool(string(makeNodeId(addr)))
 	p.Lock()
 	if c, ok := p.pick(); ok {
 		p.Unlock()
@@ -221,42 +227,45 @@ func (t *Transports) dial(addr string) (*conn, error) {
 		return c, nil
 	}
 
-	var c *conn
+	var c *Conn
 	var err error
 	if !p.da.active {
 		if !p.canAppend() {
 			p.Unlock()
 			return nil, ErrConnLimit
 		}
-		p.da.ch = make(chan struct{})
-		p.da.active = true
+		p.initDialAttempt()
 		p.Unlock()
-		c, err = t.createConn(addr) // todo: timeouts
-		c.onClose = func() { deleteConn(p, c) }
-		p.Lock()
-		if err == nil {
-			p.append(c)
-			close(c.ready)
-		}
-		p.da.notify(c, err)
-		p.Unlock()
-		go t.handleConn(c)
+		c, err = n.dialOnPool(p, addr)
 	} else {
+		da := p.da
 		p.Unlock()
-		<-p.da.ch
-		c, err = p.da.c, p.da.err
+		<-da.ch
+		c, err = da.c, da.err
 	}
 
 	return c, err
 }
 
-func (t *Transports) createConn(addr string) (*conn, error) {
+func (n *Node) dialOnPool(p *connPool, addr string) (*Conn, error) {
+	c, err := n.createConn(addr) // todo: timeouts
+	p.Lock()
+	if err == nil {
+		p.append(c)
+		close(c.ready)
+	}
+	p.da.notify(c, err)
+	p.Unlock()
+	return c, err
+}
+
+func (n *Node) createConn(addr string) (*Conn, error) {
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := t.setupOutConn(c)
+	conn, err := n.setupOutConn(c)
 	if err != nil {
 		c.Close()
 		return nil, err
@@ -265,33 +274,35 @@ func (t *Transports) createConn(addr string) (*conn, error) {
 	return conn, nil
 }
 
-func (t *Transports) setupOutConn(c net.Conn) (*conn, error) {
-	_, err := t.shareId(c)
+func (n *Node) setupOutConn(c net.Conn) (*Conn, error) {
+	remoteId, err := n.shareId(c)
 	if err != nil {
 		return nil, err
 	}
 
-	connId, err := t.recvHandshake(c)
+	connId, err := n.recvHandshake(c)
 	if err != nil {
 		return nil, err
 	}
 
 	// todo: select roles in case of TCP simultaneous open
 
-	mux, err := t.mux.client(c)
+	mux, err := n.mux.client(c)
 	if err != nil {
 		return nil, err
 	}
 
-	return &conn{
-		conn:   c,
-		connId: connId,
-		mux:    mux,
-		ready:  make(chan struct{}),
+	return &Conn{
+		node:     n,
+		connId:   connId,
+		remoteId: remoteId,
+		mux:      mux,
+		conn:     c,
+		ready:    make(chan struct{}),
 	}, nil
 }
 
-func (t *Transports) recvHandshake(c net.Conn) ([]byte, error) {
+func (n *Node) recvHandshake(c net.Conn) ([]byte, error) {
 	buf := make([]byte, 1)
 	_, err := c.Read(buf)
 	if err != nil {
@@ -310,35 +321,16 @@ func (t *Transports) recvHandshake(c net.Conn) ([]byte, error) {
 	return id, nil
 }
 
-func (t *Transports) Dial(addr string, headers ...Header) (*Stream, error) {
-	c, err := t.dial(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	mStream, err := c.mux.Open()
-	if err != nil {
-		return nil, err
-	}
-
-	s := newStream(mStream)
-	err = t.handshake.Propose(s, headers)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-func (t *Transports) Listen(addr string) error {
+func (n *Node) Listen(addr string) error {
 	var err error
-	t.once.Do(func() {
-		t.nodeId = makeNodeId(addr)
-		err = t.listen(addr)
+	n.once.Do(func() {
+		n.nodeId = makeNodeId(addr)
+		err = n.listen(addr)
 	})
 	return err
 }
 
-func (t *Transports) listen(addr string) error {
+func (n *Node) listen(addr string) error {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -352,25 +344,25 @@ func (t *Transports) listen(addr string) error {
 		}
 
 		go func() {
-			conn, err := t.tryAccept(c)
+			conn, err := n.tryAccept(c)
 			if err != nil {
 				log.Println(err.Error())
 				return
 			}
-			t.handleConn(conn)
+			n.handleConn(conn)
 		}()
 	}
 }
 
-func (t *Transports) tryAccept(c net.Conn) (*conn, error) {
-	remoteId, err := t.shareId(c)
+func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
+	remoteId, err := n.shareId(c)
 	if err != nil {
 		return nil, err
 	}
 
-	p := t.getOrMakePool(string(remoteId))
+	p := n.getOrMakePool(string(remoteId))
 	p.Lock()
-	won := p.da.active && bytes.Compare(remoteId, t.nodeId) <= 0
+	won := p.da.active && bytes.Compare(remoteId, n.nodeId) <= 0
 	if won { // if there are concurrent requests AND we won
 		p.Unlock()
 		sendReject(c)
@@ -386,16 +378,17 @@ func (t *Transports) tryAccept(c net.Conn) (*conn, error) {
 
 	connId := uuid.New()
 	connIdBytes, _ := connId.MarshalBinary()
-	conn := &conn{
-		conn:   c,
-		connId: connIdBytes,
-		ready:  make(chan struct{}),
+	conn := &Conn{
+		node:     n,
+		connId:   connIdBytes,
+		remoteId: remoteId,
+		conn:     c,
+		ready:    make(chan struct{}),
 	}
-	conn.onClose = func() { deleteConn(p, conn) }
 	p.append(conn)
 	p.Unlock()
 
-	if err = t.accept(conn); err != nil {
+	if err = n.accept(conn); err != nil {
 		conn.Close()
 		p.Lock()
 		p.delete(conn)
@@ -407,14 +400,20 @@ func (t *Transports) tryAccept(c net.Conn) (*conn, error) {
 	return conn, nil
 }
 
-func deleteConn(p *connPool, c *conn) {
+func (n *Node) deleteConn(c *Conn) {
+	n.connMu.RLock()
+	p, ok := n.connections[string(c.remoteId)]
+	n.connMu.RUnlock()
+	if !ok {
+		return
+	}
 	p.Lock()
 	p.delete(c)
 	p.Unlock()
 }
 
-func (t *Transports) shareId(c net.Conn) ([]byte, error) {
-	_, err := c.Write(t.nodeId)
+func (n *Node) shareId(c net.Conn) ([]byte, error) {
+	_, err := c.Write(n.nodeId)
 	if err != nil {
 		return nil, err
 	}
@@ -442,33 +441,11 @@ func sendAccept(c net.Conn, connId []byte) error {
 	return err
 }
 
-func (t *Transports) accept(conn *conn) error {
+func (n *Node) accept(conn *Conn) error {
 	err := sendAccept(conn.conn, conn.connId)
 	if err != nil {
 		return err
 	}
-	conn.mux, err = t.mux.server(conn.conn)
+	conn.mux, err = n.mux.server(conn.conn)
 	return err
-}
-
-func (t *Transports) handleConn(conn *conn) error {
-	if conn.mux == nil {
-		return nil
-	}
-	for {
-		c, err := conn.mux.Accept()
-		if err != nil {
-			conn.Close()
-			return err
-		}
-
-		s := newStream(c)
-		headers, err := t.handshake.Accept(s)
-		if err != nil {
-			s.Close()
-			conn.Close()
-			return err
-		}
-		go t.handle(s, headers)
-	}
 }

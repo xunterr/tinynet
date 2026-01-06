@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"encoding/binary"
 	"sync"
 
 	"github.com/xunterr/tinynet/internal/protocol"
@@ -14,18 +13,17 @@ const (
 type HandleFunc func(*Stream)
 
 type RoutedTransports struct {
-	t        *Transports
+	t        *Node
 	handlers map[uint32]HandleFunc
 	mu       sync.RWMutex
 }
 
-func NewRoutedTransports(t *Transports) *RoutedTransports {
+func NewRoutedTransports(t *Node) *RoutedTransports {
 	node := &RoutedTransports{
 		t:        t,
 		handlers: make(map[uint32]HandleFunc),
 	}
 
-	t.SetHandleFunc(node.handle)
 	return node
 }
 
@@ -46,31 +44,15 @@ func (r *RoutedTransports) route(key uint32) HandleFunc {
 	return h
 }
 
-func (n *RoutedTransports) handle(stream *Stream, headers Headers) {
-	h, ok := headers.getHeader(RouteKeyHeader)
-	if !ok {
-		stream.Close()
-		return
-	}
-	routeKey := binary.BigEndian.Uint32(h)
-	handler := n.route(routeKey)
-	if handler != nil {
-		handler(stream)
-	}
-}
-
 func (n *RoutedTransports) Listen(addr string) error {
 	return n.t.Listen(addr)
 }
 
-func (n *RoutedTransports) Dial(addr string, key uint32) (*Stream, error) {
-	var keyBytes [4]byte
-	binary.BigEndian.PutUint32(keyBytes[:], key)
-	header := Header{Type: RouteKeyHeader, Value: keyBytes[:]}
-	stream, err := n.t.Dial(addr, header)
+func (n *RoutedTransports) Dial(addr string, key uint32) (*Conn, error) {
+	conn, err := n.t.Dial(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	return stream, nil
+	return conn, nil
 }

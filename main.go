@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -12,12 +11,12 @@ import (
 )
 
 func main() {
-	t := internal.NewTransports(internal.WithMux(
+	t := internal.NewNode(internal.WithMux(
 		func(c net.Conn) (internal.Mux, error) { return yamux.Client(c, nil) },
 		func(c net.Conn) (internal.Mux, error) { return yamux.Server(c, nil) },
 	))
 
-	t2 := internal.NewTransports(internal.WithMux(
+	t2 := internal.NewNode(internal.WithMux(
 		func(c net.Conn) (internal.Mux, error) { return yamux.Client(c, nil) },
 		func(c net.Conn) (internal.Mux, error) { return yamux.Server(c, nil) },
 	))
@@ -41,12 +40,8 @@ func main() {
 		wg.Done()
 	}()
 
-	t.SetHandleFunc(func(s *internal.Stream, h internal.Headers) {
-		fmt.Printf("t#1 ---- %s \n", s.Conn.RemoteAddr().String())
-	})
-	t2.SetHandleFunc(func(s *internal.Stream, h internal.Headers) {
-		fmt.Printf("t#2 ---- %s \n", s.Conn.RemoteAddr().String())
-	})
+	t.SetHandleFunc(handle)
+	t2.SetHandleFunc(handle)
 
 	time.Sleep(2 * time.Second)
 
@@ -56,17 +51,38 @@ func main() {
 			log.Printf("67 -- %s", err.Error())
 			return
 		}
-		c.Write([]byte("hi"))
+		s, err := c.OpenStream()
+		if err != nil {
+			panic(err.Error())
+		}
+
+		s.Write([]byte("hi"))
 	}()
 
 	go func() {
-		c, err := t2.Dial("127.0.0.1:6969")
+		_, err := t2.PickOrDial("127.0.0.1:6969")
 		if err != nil {
 			log.Printf("69 -- %s", err.Error())
 			return
 		}
-		c.Write([]byte("hi2"))
 	}()
 
 	wg.Wait()
+}
+
+func handle(c *internal.Conn) {
+	for {
+		s, err := c.AcceptStream()
+		if err != nil {
+			panic(err.Error())
+		}
+
+		for {
+			b, err := s.ReadFull()
+			if err != nil {
+				panic(err)
+			}
+			log.Println(string(b))
+		}
+	}
 }

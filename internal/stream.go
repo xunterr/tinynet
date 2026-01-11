@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"errors"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ var ErrPartialRead error = errors.New("Partially read message")
 type Stream struct { // <-!!!
 	net.Conn
 	conn    *Conn
+	r       *bufio.Reader
 	n       int
 	onClose func()
 }
@@ -23,6 +25,7 @@ type Stream struct { // <-!!!
 func newStream(c net.Conn) *Stream {
 	return &Stream{
 		Conn: c,
+		r:    bufio.NewReader(c),
 		n:    0,
 	}
 }
@@ -82,7 +85,7 @@ func (s *Stream) Close() (err error) {
 // subsequent reads will read the rest of the message
 func (s *Stream) Read(p []byte) (n int, err error) {
 	if s.n == 0 {
-		header, err := protocol.ReadHeader(s.Conn)
+		header, err := protocol.ReadHeader(s.r)
 		if err != nil {
 			s.conn.TryClose()
 			return 0, err
@@ -91,7 +94,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 	}
 
 	right := min(len(p), s.n)
-	readN, err := io.ReadFull(s.Conn, p[:right])
+	readN, err := io.ReadFull(s.r, p[:right])
 	s.n -= readN
 	if err != nil {
 		s.n = 0
@@ -129,14 +132,14 @@ func (s *Stream) read() (protocol.Header, []byte, error) {
 		return protocol.Header{}, []byte{}, ErrPartialRead
 	}
 
-	h, err := protocol.ReadHeader(s.Conn)
+	h, err := protocol.ReadHeader(s.r)
 	if err != nil {
 		s.conn.TryClose()
 		return protocol.Header{}, []byte{}, err
 	}
 
 	bytes := make([]byte, h.Length)
-	_, err = io.ReadFull(s.Conn, bytes)
+	_, err = io.ReadFull(s.r, bytes)
 	if err != nil && err != io.ErrUnexpectedEOF {
 		s.conn.TryClose()
 		return protocol.Header{}, []byte{}, err

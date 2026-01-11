@@ -20,20 +20,31 @@ type Tlv struct {
 	Value []byte
 }
 
-func ReadHeader(r io.Reader) (Header, error) {
+func ReadPrefixed(r io.Reader) ([]byte, error) {
 	bytes := make([]byte, 4)
 	_, err := io.ReadFull(r, bytes)
 	if err != nil {
-		return Header{}, err
+		return nil, err
 	}
 
 	length := binary.BigEndian.Uint32(bytes)
 	bytes = make([]byte, length)
 	_, err = io.ReadFull(r, bytes)
+	return bytes, err
+}
+
+func WritePrefixed(r io.Writer, bytes []byte) (int, error) {
+	buf := make([]byte, len(bytes)+4)
+	binary.BigEndian.PutUint32(buf, uint32(len(bytes)))
+	copy(buf[4:], bytes)
+	return r.Write(buf)
+}
+
+func ReadHeader(r io.Reader) (Header, error) {
+	bytes, err := ReadPrefixed(r)
 	if err != nil {
 		return Header{}, err
 	}
-
 	_, h := parseHeader(bytes)
 	return h, nil
 }

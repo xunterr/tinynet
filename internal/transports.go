@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/xunterr/tinynet/internal/protocol"
 )
 
 const (
@@ -259,66 +260,83 @@ func (n *Node) dialOnPool(p *connPool, addr string) (*Conn, error) {
 	return c, err
 }
 
-func (n *Node) createConn(addr string) (*Conn, error) {
-	c, err := net.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := n.setupOutConn(c)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-
-	return conn, nil
+func tcpDial(addr string) (net.Conn, error) {
+	return net.Dial("tcp", addr)
 }
 
-func (n *Node) setupOutConn(c net.Conn) (*Conn, error) {
-	remoteId, err := n.shareId(c)
+func (node *Node) createConn(addr string) (*Conn, error) {
+	c, err := tcpDial(addr)
 	if err != nil {
 		return nil, err
 	}
 
-	connId, err := n.recvHandshake(c)
+	h, err := node.initHandshake(c)
 	if err != nil {
 		return nil, err
 	}
 
-	// todo: select roles in case of TCP simultaneous open
-
-	mux, err := n.mux.client(c)
+	mux, err := node.mux.client(c)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Conn{
-		node:     n,
-		connId:   connId,
-		remoteId: remoteId,
+		node:     node,
+		connId:   h.connId,
+		remoteId: h.remoteId,
 		mux:      mux,
 		conn:     c,
 		ready:    make(chan struct{}),
 	}, nil
 }
 
-func (n *Node) recvHandshake(c net.Conn) ([]byte, error) {
-	buf := make([]byte, 1)
-	_, err := c.Read(buf)
+type servHandshake struct {
+	status   byte
+	ver      byte
+	connId   []byte
+	remoteId []byte
+}
+
+func (node *Node) initHandshake(c net.Conn) (servHandshake, error) {
+	_, err := node.sendInit(c)
+	if err != nil {
+		return servHandshake{}, err
+	}
+
+	buf := make([]byte, ConnInitMsgSize+1)
+	_, err = io.ReadFull(c, buf)
+	if err != nil {
+		return servHandshake{}, err
+	}
+
+	n, ver, remoteId := readInit(buf)
+	h := servHandshake{
+		ver:      ver,
+		status:   buf[n],
+		remoteId: remoteId,
+	}
+
+	if buf[n] == ConnRejected {
+		return h, ErrHandshakeRefused
+	}
+
+	connId := make([]byte, 16)
+	_, err = io.ReadFull(c, connId)
+	if err != nil {
+		return servHandshake{}, err
+	}
+
+	h.connId = connId
+	return h, nil
+}
+
+func shareCapas(c net.Conn, capas []byte) ([]byte, error) {
+	_, err := protocol.WritePrefixed(c, capas)
 	if err != nil {
 		return nil, err
 	}
 
-	if buf[0] == ConnRejected {
-		return nil, ErrHandshakeRefused
-	}
-
-	id := make([]byte, 16)
-	_, err = io.ReadFull(c, id)
-	if err != nil {
-		return nil, err
-	}
-	return id, nil
+	return protocol.ReadPrefixed(c)
 }
 
 func (n *Node) Listen(addr string) error {
@@ -355,7 +373,7 @@ func (n *Node) listen(addr string) error {
 }
 
 func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
-	remoteId, err := n.shareId(c)
+	_, remoteId, err := n.recvInit(c)
 	if err != nil {
 		return nil, err
 	}
@@ -365,13 +383,13 @@ func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
 	won := p.da.active && bytes.Compare(remoteId, n.nodeId) <= 0
 	if won { // if there are concurrent requests AND we won
 		p.Unlock()
-		sendReject(c)
+		n.reject(c)
 		c.Close()
 		return nil, ErrConcurrent
 	}
 	if !p.canAppend() {
 		p.Unlock()
-		sendReject(c)
+		n.reject(c)
 		c.Close()
 		return nil, ErrConnLimit
 	}
@@ -412,40 +430,100 @@ func (n *Node) deleteConn(c *Conn) {
 	p.Unlock()
 }
 
-func (n *Node) shareId(c net.Conn) ([]byte, error) {
-	_, err := c.Write(n.nodeId)
-	if err != nil {
-		return nil, err
-	}
-
-	remoteId := make([]byte, 16)
-	_, err = io.ReadFull(c, remoteId)
-	return remoteId, err
+func (n *Node) sendInit(w io.Writer) (int, error) {
+	buf := make([]byte, ConnInitMsgSize)
+	putInit(buf, 0, n.nodeId)
+	return w.Write(buf)
 }
 
-// 		1	   |  16
-// ----------------
-// Status | ConnId
-
-func sendReject(c net.Conn) error {
-	_, err := c.Write([]byte{ConnRejected})
-	return err
+func (n *Node) recvInit(r io.Reader) (ver byte, id []byte, err error) {
+	buf := make([]byte, ConnInitMsgSize)
+	_, err = io.ReadFull(r, buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	_, ver, id = readInit(buf)
+	return
 }
 
-func sendAccept(c net.Conn, connId []byte) error {
-	_, err := c.Write([]byte{ConnAccepted})
-	if err != nil {
-		return err
-	}
-	_, err = c.Write(connId)
+func (n *Node) reject(c net.Conn) error {
+	buf := make([]byte, ConnInitMsgSize+1)
+	i := putInit(buf, 0, n.nodeId)
+	i = putReject(buf[i:])
+	_, err := c.Write(buf)
 	return err
 }
 
 func (n *Node) accept(conn *Conn) error {
-	err := sendAccept(conn.conn, conn.connId)
+	buf := make([]byte, ConnInitMsgSize+17)
+
+	i := putInit(buf, 0, n.nodeId)
+	i = putAccept(buf[i:], conn.connId)
+	_, err := conn.conn.Write(buf)
 	if err != nil {
 		return err
 	}
+
 	conn.mux, err = n.mux.server(conn.conn)
 	return err
+}
+
+// 		1			|		16
+// --------------------
+//	ver  |	 nodeId
+
+// 		1			|		16		|		1	  	|		16		|
+// --------------------------------------
+//	ver  |	 nodeId	 |	accept |	connId |
+
+const (
+	ConnInitMsgSize int = 17
+)
+
+func putAccept(p []byte, connId []byte) int {
+	if len(p) == 0 {
+		return 0
+	}
+	p[0] = ConnAccepted
+	end := min(len(connId)+1, len(p))
+	copy(p[1:end], connId)
+	return end
+}
+
+func putReject(p []byte) int {
+	if len(p) == 0 {
+		return 0
+	}
+	p[0] = ConnRejected
+	return 1
+}
+
+// dups now, layout may change
+
+func putInit(p []byte, ver byte, id []byte) int {
+	if len(p) == 0 {
+		return 0
+	}
+	n := ConnInitMsgSize
+	if len(p) < ConnInitMsgSize {
+		n = len(p)
+	}
+	p[0] = ver
+	copy(p[1:n], id)
+	return n
+}
+
+func readInit(p []byte) (n int, ver byte, nodeId []byte) {
+	if len(p) == 0 {
+		return 0, 0, nil
+	}
+	n = ConnInitMsgSize
+	if len(p) < ConnInitMsgSize {
+		n = len(p)
+	}
+	ver = p[0]
+	if n > 1 {
+		nodeId = p[1:n]
+	}
+	return
 }

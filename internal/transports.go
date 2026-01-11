@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/xunterr/tinynet/internal/protocol"
 )
 
 const (
@@ -21,12 +20,6 @@ const (
 var ErrHandshakeRefused = errors.New("Remote node refused a handshake.")
 var ErrConcurrent = errors.New("Concurrent dials.")
 var ErrConnLimit = errors.New("Per-node connection limit reached.")
-
-// Used on Stream initialization for sharing stream-scope headers.
-type Handshake interface {
-	Accept(*Stream) ([]Header, error)
-	Propose(*Stream, []Header) error
-}
 
 type Mux interface {
 	Open() (net.Conn, error)
@@ -42,9 +35,17 @@ type asymMux struct {
 	server MuxFunc
 }
 
+// Function to be called on a connection
+type SetupFunc func(net.Conn) (net.Conn, error)
+
+type connSetup struct {
+	open   SetupFunc
+	accept SetupFunc
+}
+
 type Option func(*Node)
 
-// set up a muxer
+// Set up a muxer
 func WithMux(client MuxFunc, server MuxFunc) Option {
 	return func(n *Node) {
 		n.mux = asymMux{
@@ -54,13 +55,16 @@ func WithMux(client MuxFunc, server MuxFunc) Option {
 	}
 }
 
-// sets up a symmetrical muxer (client and server muxers are the same)
+// Set up a symmetrical muxer (client and server muxers are the same)
 func SymMux(m MuxFunc) (MuxFunc, MuxFunc) {
 	return m, m
 }
 
-func WithHandshake(h Handshake) Option {
-	return func(n *Node) { n.handshake = h }
+// Set up a functions to be called on a connection setup
+func WithSetup(open SetupFunc, accept SetupFunc) Option {
+	return func(n *Node) {
+		n.setup = connSetup{open, accept}
+	}
 }
 
 type dialAttempt struct {
@@ -142,8 +146,6 @@ func (p *connPool) delete(c *Conn) bool {
 type Node struct {
 	handleConn func(*Conn)
 
-	handshake Handshake
-
 	nodeId []byte
 
 	connMu         sync.RWMutex
@@ -152,14 +154,21 @@ type Node struct {
 
 	mux asymMux
 
+	setup connSetup
+
 	once sync.Once
+}
+
+var NopSetup = connSetup{
+	func(c net.Conn) (net.Conn, error) { return c, nil },
+	func(c net.Conn) (net.Conn, error) { return c, nil },
 }
 
 func NewNode(opts ...Option) *Node {
 	n := &Node{
 		connections:    make(map[string]*connPool),
-		handshake:      &DefaultHandshake{},
 		maxConnPerNode: 1,
+		setup:          NopSetup,
 	}
 
 	for _, opt := range opts {
@@ -275,6 +284,11 @@ func (node *Node) createConn(addr string) (*Conn, error) {
 		return nil, err
 	}
 
+	c, err = node.setup.open(c)
+	if err != nil {
+		return nil, err
+	}
+
 	mux, err := node.mux.client(c)
 	if err != nil {
 		return nil, err
@@ -328,15 +342,6 @@ func (node *Node) initHandshake(c net.Conn) (servHandshake, error) {
 
 	h.connId = connId
 	return h, nil
-}
-
-func shareCapas(c net.Conn, capas []byte) ([]byte, error) {
-	_, err := protocol.WritePrefixed(c, capas)
-	if err != nil {
-		return nil, err
-	}
-
-	return protocol.ReadPrefixed(c)
 }
 
 func (n *Node) Listen(addr string) error {
@@ -464,6 +469,10 @@ func (n *Node) accept(conn *Conn) error {
 		return err
 	}
 
+	conn.conn, err = n.setup.open(conn.conn)
+	if err != nil {
+		return err
+	}
 	conn.mux, err = n.mux.server(conn.conn)
 	return err
 }

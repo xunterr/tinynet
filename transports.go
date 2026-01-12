@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"sync"
 
@@ -143,6 +142,7 @@ func (p *connPool) delete(c *Conn) bool {
 
 type Node struct {
 	handleConn func(*Conn)
+	l          net.Listener
 
 	nodeId []byte
 
@@ -352,28 +352,25 @@ func (n *Node) Listen(addr string) error {
 	return err
 }
 
+func (n *Node) Close() error {
+	return n.l.Close()
+}
+
 func (n *Node) listen(addr string) error {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
+	n.l = l
+	return nil
+}
 
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			log.Println(err.Error())
-			continue
-		}
-
-		go func() {
-			conn, err := n.tryAccept(c)
-			if err != nil {
-				log.Println(err.Error())
-				return
-			}
-			n.handleConn(conn)
-		}()
+func (n *Node) Accept() (*Conn, error) {
+	c, err := n.l.Accept()
+	if err != nil {
+		return nil, err
 	}
+	return n.tryAccept(c)
 }
 
 func (n *Node) tryAccept(c net.Conn) (*Conn, error) {

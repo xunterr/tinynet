@@ -1,4 +1,4 @@
-package internal
+package main
 
 import (
 	"bufio"
@@ -6,7 +6,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/xunterr/tinynet/internal/protocol"
+	"github.com/xunterr/tinynet/protocol"
 )
 
 type Header = protocol.Tlv

@@ -1,4 +1,4 @@
-package internal
+package main
 
 import (
 	"bytes"
@@ -46,12 +46,10 @@ type connSetup struct {
 type Option func(*Node)
 
 // Set up a muxer
-func WithMux(client MuxFunc, server MuxFunc) Option {
-	return func(n *Node) {
-		n.mux = asymMux{
-			client: client,
-			server: server,
-		}
+func NewMux(client MuxFunc, server MuxFunc) asymMux {
+	return asymMux{
+		client: client,
+		server: server,
 	}
 }
 
@@ -164,11 +162,12 @@ var NopSetup = connSetup{
 	func(c net.Conn) (net.Conn, error) { return c, nil },
 }
 
-func NewNode(opts ...Option) *Node {
+func NewNode(mux asymMux, opts ...Option) *Node {
 	n := &Node{
 		connections:    make(map[string]*connPool),
 		maxConnPerNode: 1,
 		setup:          NopSetup,
+		mux:            mux,
 	}
 
 	for _, opt := range opts {

@@ -1,11 +1,5 @@
 package protocol
 
-// TLV napespaces
-const (
-	CustomNamespace uint8 = iota
-	RouteNamespace
-)
-
 func WithNamespace(namespace uint8, id uint8) uint16 {
 	return uint16(namespace)<<8 | uint16(id)
 }

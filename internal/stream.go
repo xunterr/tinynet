@@ -44,25 +44,19 @@ func FromBytes(b []byte) Message {
 }
 
 // As user-space header
-func AsHeader(id byte, val []byte) Header {
+func AsHeader(id uint16, val []byte) Header {
 	return Header{
-		Type:  protocol.WithNamespace(protocol.CustomNamespace, id),
+		Type:  id,
 		Value: val,
 	}
 }
 
-func (h *Headers) AddHeader(id byte, val []byte) {
+func (h *Headers) AddHeader(id uint16, val []byte) {
 	*h = append(*h, AsHeader(id, val))
 }
 
-// Get user-space header by its id
-// O(n) lookup
-func (h Headers) GetHeader(id byte) ([]byte, bool) {
-	return h.getHeader(protocol.WithNamespace(protocol.CustomNamespace, id))
-}
-
 // Get header by its key
-func (h Headers) getHeader(key uint16) ([]byte, bool) {
+func (h Headers) GetHeader(key uint16) ([]byte, bool) {
 	for _, h := range h {
 		if h.Type == key {
 			return h.Value, true

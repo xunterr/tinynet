@@ -32,8 +32,10 @@ func newStream(c net.Conn) *Stream {
 }
 
 type Message struct {
-	Headers Headers
+	Ver     byte
+	Type    uint32
 	Body    []byte
+	Headers Headers
 }
 
 func FromBytes(b []byte) Message {
@@ -117,6 +119,8 @@ func (s *Stream) ReadMessage() (Message, error) {
 	}
 
 	return Message{
+		Ver:     h.Version,
+		Type:    h.Type,
 		Headers: h.Tlvs,
 		Body:    bytes,
 	}, nil
@@ -155,8 +159,8 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 // Write Message to Stream
 func (s *Stream) WriteMessage(msg Message) (n int, err error) {
 	header := protocol.Header{
-		Version: 0,
-		Type:    0,
+		Version: msg.Ver,
+		Type:    msg.Type,
 		Length:  uint32(len(msg.Body)),
 		Tlvs:    msg.Headers,
 	}

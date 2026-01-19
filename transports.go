@@ -57,10 +57,17 @@ func SymMux(m MuxFunc) (MuxFunc, MuxFunc) {
 	return m, m
 }
 
-// Set up a functions to be called on a connection setup
+// Set up functions to be called on a connection setup
 func WithSetup(open SetupFunc, accept SetupFunc) Option {
 	return func(n *Node) {
 		n.setup = connSetup{open, accept}
+	}
+}
+
+// Set up max conns per node
+func WithMaxConns(maxConns int) Option {
+	return func(n *Node) {
+		n.maxConnPerNode = maxConns
 	}
 }
 

@@ -388,7 +388,7 @@ func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
 
 	p := n.getOrMakePool(string(remoteId))
 	p.Lock()
-	won := p.da.active && bytes.Compare(remoteId, n.nodeId) <= 0
+	won := p.da.active && bytes.Compare(remoteId, n.nodeId) < 0
 	if won { // if there are concurrent requests AND we won
 		p.Unlock()
 		n.reject(c)

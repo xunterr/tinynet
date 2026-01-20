@@ -82,7 +82,7 @@ func (c *Conn) OpenStream() (*Stream, error) {
 		return nil, err
 	}
 
-	s := newStream(mStream)
+	s := newStream(mStream, c)
 	return s, nil
 }
 
@@ -93,6 +93,6 @@ func (c *Conn) AcceptStream() (*Stream, error) {
 		return nil, err
 	}
 
-	s := newStream(mStream)
+	s := newStream(mStream, c)
 	return s, nil
 }

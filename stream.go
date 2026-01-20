@@ -22,10 +22,11 @@ type Stream struct { // <-!!!
 	onClose func()
 }
 
-func newStream(c net.Conn) *Stream {
+func newStream(s net.Conn, conn *Conn) *Stream {
 	return &Stream{
-		Conn:    c,
-		r:       bufio.NewReader(c),
+		Conn:    s,
+		conn:    conn,
+		r:       bufio.NewReader(s),
 		n:       0,
 		onClose: func() {},
 	}

@@ -58,6 +58,10 @@ func (c *Conn) IsActive() bool {
 	return false
 }
 
+func (c *Conn) ConnId() []byte {
+	return c.connId
+}
+
 func (c *Conn) Close() error {
 	var err error
 	c.once.Do(func() {

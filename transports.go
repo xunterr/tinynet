@@ -148,8 +148,8 @@ func (p *connPool) delete(c *Conn) bool {
 }
 
 type Node struct {
-	handleConn func(*Conn)
-	l          net.Listener
+	onConn chan *Conn
+	l      net.Listener
 
 	nodeId []byte
 
@@ -171,6 +171,7 @@ var NopSetup = connSetup{
 
 func NewNode(mux asymMux, opts ...Option) *Node {
 	n := &Node{
+		onConn:         make(chan *Conn),
 		connections:    make(map[string]*connPool),
 		maxConnPerNode: 1,
 		setup:          NopSetup,
@@ -189,15 +190,15 @@ func makeNodeId(key string) []byte {
 	return sum[:16]
 }
 
-func (n *Node) SetMux(client MuxFunc, server MuxFunc) {
-	n.mux = asymMux{
-		client: client,
-		server: server,
-	}
+func (n *Node) OnConn() <-chan *Conn {
+	return n.onConn
 }
 
-func (n *Node) SetHandleFunc(h func(*Conn)) {
-	n.handleConn = h
+func (n *Node) notifyOnConn(c *Conn) {
+	select {
+	case n.onConn <- c:
+	default:
+	}
 }
 
 func (n *Node) getOrMakePool(key string) *connPool {
@@ -272,6 +273,10 @@ func (n *Node) dialOnPool(p *connPool, addr string) (*Conn, error) {
 	}
 	p.da.notify(c, err)
 	p.Unlock()
+
+	if err == nil {
+		n.notifyOnConn(c)
+	}
 	return c, err
 }
 
@@ -423,6 +428,7 @@ func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
 	}
 
 	close(conn.ready)
+	n.notifyOnConn(conn)
 	return conn, nil
 }
 

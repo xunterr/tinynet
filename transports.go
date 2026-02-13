@@ -19,6 +19,7 @@ const (
 var ErrHandshakeRefused = errors.New("Remote node refused a handshake.")
 var ErrConcurrent = errors.New("Concurrent dials.")
 var ErrConnLimit = errors.New("Per-node connection limit reached.")
+var ErrNoId = errors.New("No node ID")
 
 type Mux interface {
 	Open() (net.Conn, error)
@@ -148,8 +149,8 @@ func (p *connPool) delete(c *Conn) bool {
 }
 
 type Node struct {
-	onConn chan *Conn
-	l      net.Listener
+	connCh chan *Conn
+	errCh  chan error
 
 	nodeId []byte
 
@@ -171,11 +172,13 @@ var NopSetup = connSetup{
 
 func NewNode(mux asymMux, opts ...Option) *Node {
 	n := &Node{
-		onConn:         make(chan *Conn),
 		connections:    make(map[string]*connPool),
 		maxConnPerNode: 1,
 		setup:          NopSetup,
 		mux:            mux,
+
+		connCh: make(chan *Conn),
+		errCh:  make(chan error),
 	}
 
 	for _, opt := range opts {
@@ -185,20 +188,13 @@ func NewNode(mux asymMux, opts ...Option) *Node {
 	return n
 }
 
+func (n *Node) ID() []byte {
+	return n.nodeId
+}
+
 func makeNodeId(key string) []byte {
 	sum := sha256.Sum256([]byte(key))
 	return sum[:16]
-}
-
-func (n *Node) OnConn() <-chan *Conn {
-	return n.onConn
-}
-
-func (n *Node) notifyOnConn(c *Conn) {
-	select {
-	case n.onConn <- c:
-	default:
-	}
 }
 
 func (n *Node) getOrMakePool(key string) *connPool {
@@ -275,21 +271,26 @@ func (n *Node) dialOnPool(p *connPool, addr string) (*Conn, error) {
 	p.Unlock()
 
 	if err == nil {
-		n.notifyOnConn(c)
+		n.connCh <- c
 	}
 	return c, err
 }
 
-func tcpDial(addr string) (net.Conn, error) {
-	return net.Dial("tcp", addr)
-}
-
 func (node *Node) createConn(addr string) (*Conn, error) {
-	c, err := tcpDial(addr)
+	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
+	conn, err := node.initConn(c)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (node *Node) initConn(c net.Conn) (*Conn, error) {
 	h, err := node.initHandshake(c)
 	if err != nil {
 		return nil, err
@@ -364,25 +365,37 @@ func (n *Node) Listen(addr string) error {
 	return err
 }
 
-func (n *Node) Close() error {
-	return n.l.Close()
-}
-
 func (n *Node) listen(addr string) error {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	n.l = l
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				n.errCh <- err
+				continue
+			}
+			conn, err := n.tryAccept(c)
+			if err != nil {
+				c.Close()
+				n.errCh <- err
+				continue
+			}
+			n.connCh <- conn
+		}
+	}()
 	return nil
 }
 
 func (n *Node) Accept() (*Conn, error) {
-	c, err := n.l.Accept()
-	if err != nil {
+	select {
+	case c := <-n.connCh:
+		return c, nil
+	case err := <-n.errCh:
 		return nil, err
 	}
-	return n.tryAccept(c)
 }
 
 func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
@@ -397,13 +410,11 @@ func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
 	if won { // if there are concurrent requests AND we won
 		p.Unlock()
 		n.reject(c)
-		c.Close()
 		return nil, ErrConcurrent
 	}
 	if !p.canAppend() {
 		p.Unlock()
 		n.reject(c)
-		c.Close()
 		return nil, ErrConnLimit
 	}
 
@@ -419,16 +430,21 @@ func (n *Node) tryAccept(c net.Conn) (*Conn, error) {
 	p.append(conn)
 	p.Unlock()
 
-	if err = n.accept(conn); err != nil {
-		conn.Close()
-		p.Lock()
-		p.delete(conn)
-		p.Unlock()
+	if err = n.accept(c, conn.connId); err != nil {
+		n.deleteConnFrom(conn, p)
+		return nil, err
+	}
+
+	if conn.conn, err = n.setup.accept(conn.conn); err != nil {
+		n.deleteConnFrom(conn, p)
+		return nil, err
+	}
+	if conn.mux, err = n.mux.server(conn.conn); err != nil {
+		n.deleteConnFrom(conn, p)
 		return nil, err
 	}
 
 	close(conn.ready)
-	n.notifyOnConn(conn)
 	return conn, nil
 }
 
@@ -439,12 +455,19 @@ func (n *Node) deleteConn(c *Conn) {
 	if !ok {
 		return
 	}
+	n.deleteConnFrom(c, p)
+}
+
+func (n *Node) deleteConnFrom(c *Conn, p *connPool) {
 	p.Lock()
 	p.delete(c)
 	p.Unlock()
 }
 
 func (n *Node) sendInit(w io.Writer) (int, error) {
+	if n.nodeId == nil {
+		return 0, ErrNoId
+	}
 	buf := make([]byte, ConnInitMsgSize)
 	putInit(buf, 0, n.nodeId)
 	return w.Write(buf)
@@ -468,31 +491,34 @@ func (n *Node) reject(c net.Conn) error {
 	return err
 }
 
-func (n *Node) accept(conn *Conn) error {
+func (n *Node) accept(c net.Conn, id []byte) error {
+	if n.nodeId == nil {
+		return ErrNoId
+	}
+
 	buf := make([]byte, ConnInitMsgSize+17)
-
 	i := putInit(buf, 0, n.nodeId)
-	i = putAccept(buf[i:], conn.connId)
-	_, err := conn.conn.Write(buf)
-	if err != nil {
-		return err
-	}
-
-	conn.conn, err = n.setup.open(conn.conn)
-	if err != nil {
-		return err
-	}
-	conn.mux, err = n.mux.server(conn.conn)
+	i = putAccept(buf[i:], id)
+	_, err := c.Write(buf)
 	return err
 }
 
+//	Client
 // 		1			|		16
 // --------------------
 //	ver  |	 nodeId
 
+// Server (Accept)
+//
 // 		1			|		16		|		1	  	|		16		|
 // --------------------------------------
 //	ver  |	 nodeId	 |	accept |	connId |
+
+// Server (Reject)
+//
+// 		1			|		16		|		1	  	|
+// ----------------------------
+//	ver  |	 nodeId	 |	accept |
 
 const (
 	ConnInitMsgSize int = 17
@@ -516,16 +542,11 @@ func putReject(p []byte) int {
 	return 1
 }
 
-// dups now, layout may change
-
 func putInit(p []byte, ver byte, id []byte) int {
 	if len(p) == 0 {
 		return 0
 	}
-	n := ConnInitMsgSize
-	if len(p) < ConnInitMsgSize {
-		n = len(p)
-	}
+	n := min(len(p), ConnInitMsgSize)
 	p[0] = ver
 	copy(p[1:n], id)
 	return n
